@@ -1366,6 +1366,21 @@ impl OpenFangKernel {
             }
         }
 
+        // Snapshot skill registry early so workspace skills are included in the prompt
+        let mut skill_snapshot = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        if let Some(ref workspace) = manifest.workspace {
+            let ws_skills = workspace.join("skills");
+            if ws_skills.exists() {
+                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
+                    warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming prompt): {e}");
+                }
+            }
+        }
+
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
@@ -1396,8 +1411,8 @@ impl OpenFangKernel {
                 base_system_prompt: manifest.model.system_prompt.clone(),
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![],
-                skill_summary: self.build_skill_summary(&manifest.skills),
-                skill_prompt_context: self.collect_prompt_context(&manifest.skills),
+                skill_summary: Self::build_skill_summary_from_registry(&skill_snapshot, &manifest.skills),
+                skill_prompt_context: Self::collect_prompt_context_from_registry(&skill_snapshot, &manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -1500,21 +1515,7 @@ impl OpenFangKernel {
             }
 
             let messages_before = session.messages.len();
-            let mut skill_snapshot = kernel_clone
-                .skill_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .snapshot();
-
-            // Load workspace-scoped skills (override global skills with same name)
-            if let Some(ref workspace) = manifest.workspace {
-                let ws_skills = workspace.join("skills");
-                if ws_skills.exists() {
-                    if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
-                        warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming): {e}");
-                    }
-                }
-            }
+            // skill_snapshot already created (with workspace skills) before prompt build
 
             // Create a phase callback that emits PhaseChange events to WS/SSE clients
             let phase_tx = tx.clone();
@@ -1838,6 +1839,21 @@ impl OpenFangKernel {
             }
         }
 
+        // Snapshot skill registry early so workspace skills are included in the prompt
+        let mut skill_snapshot = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        if let Some(ref workspace) = manifest.workspace {
+            let ws_skills = workspace.join("skills");
+            if ws_skills.exists() {
+                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
+                    warn!(agent_id = %agent_id, "Failed to load workspace skills: {e}");
+                }
+            }
+        }
+
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
@@ -1868,8 +1884,8 @@ impl OpenFangKernel {
                 base_system_prompt: manifest.model.system_prompt.clone(),
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![], // Recalled in agent_loop, not here
-                skill_summary: self.build_skill_summary(&manifest.skills),
-                skill_prompt_context: self.collect_prompt_context(&manifest.skills),
+                skill_summary: Self::build_skill_summary_from_registry(&skill_snapshot, &manifest.skills),
+                skill_prompt_context: Self::collect_prompt_context_from_registry(&skill_snapshot, &manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -1985,23 +2001,6 @@ impl OpenFangKernel {
             cat.find_model(&manifest.model.model)
                 .map(|m| m.context_window as usize)
         });
-
-        // Snapshot skill registry before async call (RwLockReadGuard is !Send)
-        let mut skill_snapshot = self
-            .skill_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .snapshot();
-
-        // Load workspace-scoped skills (override global skills with same name)
-        if let Some(ref workspace) = manifest.workspace {
-            let ws_skills = workspace.join("skills");
-            if ws_skills.exists() {
-                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
-                    warn!(agent_id = %agent_id, "Failed to load workspace skills: {e}");
-                }
-            }
-        }
 
         // Build link context from user message (auto-extract URLs for the agent)
         let message_with_links = if let Some(link_ctx) =
@@ -4130,11 +4129,20 @@ impl OpenFangKernel {
 
     /// Build a compact skill summary for the system prompt so the agent knows
     /// what extra capabilities are installed.
+    #[allow(dead_code)]
     fn build_skill_summary(&self, skill_allowlist: &[String]) -> String {
         let registry = self
             .skill_registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
+        Self::build_skill_summary_from_registry(&registry, skill_allowlist)
+    }
+
+    /// Build skill summary from an explicit registry (e.g. a snapshot with workspace skills).
+    fn build_skill_summary_from_registry(
+        registry: &openfang_skills::registry::SkillRegistry,
+        skill_allowlist: &[String],
+    ) -> String {
         let skills: Vec<_> = registry
             .list()
             .into_iter()
@@ -4239,13 +4247,20 @@ impl OpenFangKernel {
     // inject_user_personalization() — logic moved to prompt_builder::build_user_section()
 
     pub fn collect_prompt_context(&self, skill_allowlist: &[String]) -> String {
-        let mut context_parts = Vec::new();
-        for skill in self
+        let registry = self
             .skill_registry
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .list()
-        {
+            .unwrap_or_else(|e| e.into_inner());
+        Self::collect_prompt_context_from_registry(&registry, skill_allowlist)
+    }
+
+    /// Collect prompt context from an explicit registry (e.g. a snapshot with workspace skills).
+    fn collect_prompt_context_from_registry(
+        registry: &openfang_skills::registry::SkillRegistry,
+        skill_allowlist: &[String],
+    ) -> String {
+        let mut context_parts = Vec::new();
+        for skill in registry.list() {
             if skill.enabled
                 && (skill_allowlist.is_empty()
                     || skill_allowlist.contains(&skill.manifest.skill.name))
