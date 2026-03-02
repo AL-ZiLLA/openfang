@@ -51,6 +51,20 @@ const MAX_CONTINUATIONS: u32 = 5;
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
 
+/// Strip a provider prefix from a model ID before sending to the API.
+///
+/// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
+/// but the upstream API expects just `org/model`. This also handles special routers
+/// like `openrouter/auto` → `auto`.
+pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
+    let prefix = format!("{}/", provider);
+    if model.starts_with(&prefix) {
+        model[prefix.len()..].to_string()
+    } else {
+        model.to_string()
+    }
+}
+
 /// Default context window size (tokens) for token-based trimming.
 const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
 
@@ -281,8 +295,11 @@ pub async fn run_agent_loop(
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
+        // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
+        let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+
         let request = CompletionRequest {
-            model: manifest.model.model.clone(),
+            model: api_model,
             messages: messages.clone(),
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
@@ -536,6 +553,7 @@ pub async fn run_agent_loop(
                             warn!(tool = %tool_call.name, "Tool call blocked by loop guard");
                             tool_result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
                                 content: msg.clone(),
                                 is_error: true,
                             });
@@ -573,6 +591,7 @@ pub async fn run_agent_loop(
                         if let Err(reason) = hook_reg.fire(&ctx) {
                             tool_result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
                                 content: format!(
                                     "Hook blocked tool '{}': {}",
                                     tool_call.name, reason
@@ -656,6 +675,7 @@ pub async fn run_agent_loop(
 
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
+                        tool_name: tool_call.name.clone(),
                         content: final_content,
                         is_error: result.is_error,
                     });
@@ -1186,8 +1206,11 @@ pub async fn run_agent_loop_streaming(
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
+        // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
+        let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+
         let request = CompletionRequest {
-            model: manifest.model.model.clone(),
+            model: api_model,
             messages: messages.clone(),
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
@@ -1439,6 +1462,7 @@ pub async fn run_agent_loop_streaming(
                             warn!(tool = %tool_call.name, "Tool call blocked by loop guard (streaming)");
                             tool_result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
                                 content: msg.clone(),
                                 is_error: true,
                             });
@@ -1476,6 +1500,7 @@ pub async fn run_agent_loop_streaming(
                         if let Err(reason) = hook_reg.fire(&ctx) {
                             tool_result_blocks.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
                                 content: format!(
                                     "Hook blocked tool '{}': {}",
                                     tool_call.name, reason
@@ -1573,6 +1598,7 @@ pub async fn run_agent_loop_streaming(
 
                     tool_result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: result.tool_use_id,
+                        tool_name: tool_call.name.clone(),
                         content: final_content,
                         is_error: result.is_error,
                     });

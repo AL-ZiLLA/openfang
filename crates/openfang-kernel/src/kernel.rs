@@ -14,7 +14,9 @@ use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId};
 
 use openfang_memory::MemorySubstrate;
-use openfang_runtime::agent_loop::{run_agent_loop, run_agent_loop_streaming, AgentLoopResult};
+use openfang_runtime::agent_loop::{
+    run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
+};
 use openfang_runtime::audit::AuditLog;
 use openfang_runtime::drivers;
 use openfang_runtime::kernel_handle::{self, KernelHandle};
@@ -446,7 +448,7 @@ fn read_identity_file(workspace: &Path, filename: &str) -> Option<String> {
         return None;
     }
     if content.len() > MAX_IDENTITY_FILE_BYTES {
-        Some(content[..MAX_IDENTITY_FILE_BYTES].to_string())
+        Some(openfang_types::truncate_str(&content, MAX_IDENTITY_FILE_BYTES).to_string())
     } else {
         Some(content)
     }
@@ -482,6 +484,11 @@ impl OpenFangKernel {
     /// Boot the kernel with an explicit configuration.
     pub fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
         use openfang_types::config::KernelMode;
+
+        // Env var overrides — useful for Docker where config.toml is baked in.
+        if let Ok(listen) = std::env::var("OPENFANG_LISTEN") {
+            config.api_listen = listen;
+        }
 
         // Clamp configuration bounds to prevent zero-value or unbounded misconfigs
         config.clamp_bounds();
@@ -598,6 +605,9 @@ impl OpenFangKernel {
                 config.provider_urls.len()
             );
         }
+        // Load user's custom models from ~/.openfang/custom_models.json
+        let custom_models_path = config.home_dir.join("custom_models.json");
+        model_catalog.load_custom_models(&custom_models_path);
         let available_count = model_catalog.available_models().len();
         let total_count = model_catalog.list_models().len();
         let local_count = model_catalog
@@ -902,6 +912,29 @@ impl OpenFangKernel {
                         restored_entry.manifest.exec_policy =
                             Some(kernel.config.exec_policy.clone());
                     }
+
+                    // Apply global budget defaults to restored agents
+                    apply_budget_defaults(
+                        &kernel.config.budget,
+                        &mut restored_entry.manifest.resources,
+                    );
+
+                    // Apply default_model to restored agents (same logic as spawn)
+                    if restored_entry.manifest.model.api_key_env.is_none()
+                        && restored_entry.manifest.model.base_url.is_none()
+                    {
+                        let dm = &kernel.config.default_model;
+                        if !dm.provider.is_empty() {
+                            restored_entry.manifest.model.provider = dm.provider.clone();
+                        }
+                        if !dm.model.is_empty() {
+                            restored_entry.manifest.model.model = dm.model.clone();
+                        }
+                        if dm.base_url.is_some() {
+                            restored_entry.manifest.model.base_url = dm.base_url.clone();
+                        }
+                    }
+
                     if let Err(e) = kernel.registry.register(restored_entry) {
                         tracing::warn!(agent = %name, "Failed to restore agent: {e}");
                     } else {
@@ -978,6 +1011,15 @@ impl OpenFangKernel {
                 manifest.model.base_url = dm.base_url.clone();
             }
         }
+
+        // Normalize: strip provider prefix from model name if present
+        let normalized = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+        if normalized != manifest.model.model {
+            manifest.model.model = normalized;
+        }
+
+        // Apply global budget defaults to agent resource quotas
+        apply_budget_defaults(&self.config.budget, &mut manifest.resources);
 
         // Create workspace directory for the agent
         let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| {
@@ -1324,6 +1366,21 @@ impl OpenFangKernel {
             }
         }
 
+        // Snapshot skill registry early so workspace skills are included in the prompt
+        let mut skill_snapshot = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        if let Some(ref workspace) = manifest.workspace {
+            let ws_skills = workspace.join("skills");
+            if ws_skills.exists() {
+                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
+                    warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming prompt): {e}");
+                }
+            }
+        }
+
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
@@ -1335,14 +1392,27 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
+            let peer_agents: Vec<(String, String, String)> = self
+                .registry
+                .list()
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        format!("{:?}", a.state),
+                        a.manifest.model.model.clone(),
+                    )
+                })
+                .collect();
+
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![],
-                skill_summary: self.build_skill_summary(&manifest.skills),
-                skill_prompt_context: self.collect_prompt_context(&manifest.skills),
+                skill_summary: Self::build_skill_summary_from_registry(&skill_snapshot, &manifest.skills),
+                skill_prompt_context: Self::collect_prompt_context_from_registry(&skill_snapshot, &manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -1399,6 +1469,7 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
+                peer_agents,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -1444,21 +1515,7 @@ impl OpenFangKernel {
             }
 
             let messages_before = session.messages.len();
-            let mut skill_snapshot = kernel_clone
-                .skill_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .snapshot();
-
-            // Load workspace-scoped skills (override global skills with same name)
-            if let Some(ref workspace) = manifest.workspace {
-                let ws_skills = workspace.join("skills");
-                if ws_skills.exists() {
-                    if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
-                        warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming): {e}");
-                    }
-                }
-            }
+            // skill_snapshot already created (with workspace skills) before prompt build
 
             // Create a phase callback that emits PhaseChange events to WS/SSE clients
             let phase_tx = tx.clone();
@@ -1782,6 +1839,21 @@ impl OpenFangKernel {
             }
         }
 
+        // Snapshot skill registry early so workspace skills are included in the prompt
+        let mut skill_snapshot = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        if let Some(ref workspace) = manifest.workspace {
+            let ws_skills = workspace.join("skills");
+            if ws_skills.exists() {
+                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
+                    warn!(agent_id = %agent_id, "Failed to load workspace skills: {e}");
+                }
+            }
+        }
+
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
@@ -1793,14 +1865,27 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
+            let peer_agents: Vec<(String, String, String)> = self
+                .registry
+                .list()
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        format!("{:?}", a.state),
+                        a.manifest.model.model.clone(),
+                    )
+                })
+                .collect();
+
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![], // Recalled in agent_loop, not here
-                skill_summary: self.build_skill_summary(&manifest.skills),
-                skill_prompt_context: self.collect_prompt_context(&manifest.skills),
+                skill_summary: Self::build_skill_summary_from_registry(&skill_snapshot, &manifest.skills),
+                skill_prompt_context: Self::collect_prompt_context_from_registry(&skill_snapshot, &manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -1857,6 +1942,7 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
+                peer_agents,
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -1890,7 +1976,7 @@ impl OpenFangKernel {
             router.resolve_aliases(&self.model_catalog.read().unwrap_or_else(|e| e.into_inner()));
             // Build a probe request to score complexity
             let probe = CompletionRequest {
-                model: manifest.model.model.clone(),
+                model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
                 messages: vec![openfang_types::message::Message::user(message)],
                 tools: tools.clone(),
                 max_tokens: manifest.model.max_tokens,
@@ -1915,23 +2001,6 @@ impl OpenFangKernel {
             cat.find_model(&manifest.model.model)
                 .map(|m| m.context_window as usize)
         });
-
-        // Snapshot skill registry before async call (RwLockReadGuard is !Send)
-        let mut skill_snapshot = self
-            .skill_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .snapshot();
-
-        // Load workspace-scoped skills (override global skills with same name)
-        if let Some(ref workspace) = manifest.workspace {
-            let ws_skills = workspace.join("skills");
-            if ws_skills.exists() {
-                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
-                    warn!(agent_id = %agent_id, "Failed to load workspace skills: {e}");
-                }
-            }
-        }
 
         // Build link context from user message (auto-extract URLs for the agent)
         let message_with_links = if let Some(link_ctx) =
@@ -2073,6 +2142,35 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         info!(agent_id = %agent_id, "Session reset (summary saved to memory)");
+        Ok(())
+    }
+
+    /// Clear ALL conversation history for an agent (sessions + canonical).
+    ///
+    /// Creates a fresh empty session afterward so the agent is still usable.
+    pub fn clear_agent_history(&self, agent_id: AgentId) -> KernelResult<()> {
+        let _entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        // Delete all regular sessions
+        let _ = self.memory.delete_agent_sessions(agent_id);
+
+        // Delete canonical (cross-channel) session
+        let _ = self.memory.delete_canonical_session(agent_id);
+
+        // Create a fresh session
+        let new_session = self
+            .memory
+            .create_session(agent_id)
+            .map_err(KernelError::OpenFang)?;
+
+        // Update registry with new session ID
+        self.registry
+            .update_session_id(agent_id, new_session.id)
+            .map_err(KernelError::OpenFang)?;
+
+        info!(agent_id = %agent_id, "All agent history cleared");
         Ok(())
     }
 
@@ -2255,16 +2353,23 @@ impl OpenFangKernel {
         // If catalog lookup failed, try to infer provider from model name prefix
         let provider = resolved_provider.or_else(|| infer_provider_from_model(model));
 
+        // Strip the provider prefix from the model name (e.g. "openrouter/deepseek/deepseek-chat" → "deepseek/deepseek-chat")
+        let normalized_model = if let Some(ref prov) = provider {
+            strip_provider_prefix(model, prov)
+        } else {
+            model.to_string()
+        };
+
         if let Some(provider) = provider {
             self.registry
-                .update_model_and_provider(agent_id, model.to_string(), provider.clone())
+                .update_model_and_provider(agent_id, normalized_model.clone(), provider.clone())
                 .map_err(KernelError::OpenFang)?;
-            info!(agent_id = %agent_id, model = %model, provider = %provider, "Agent model+provider updated");
+            info!(agent_id = %agent_id, model = %normalized_model, provider = %provider, "Agent model+provider updated");
         } else {
             self.registry
-                .update_model(agent_id, model.to_string())
+                .update_model(agent_id, normalized_model.clone())
                 .map_err(KernelError::OpenFang)?;
-            info!(agent_id = %agent_id, model = %model, "Agent model updated (provider unchanged)");
+            info!(agent_id = %agent_id, model = %normalized_model, "Agent model updated (provider unchanged)");
         }
 
         // Persist the updated entry
@@ -3968,12 +4073,23 @@ impl OpenFangKernel {
 
         let caps = self.capabilities.list(agent_id);
 
-        // If agent has ToolAll, return all tools
+        // Apply per-agent blocklist
+        let empty_blocked: Vec<String> = Vec::new();
+        let blocked = entry
+            .as_ref()
+            .map(|e| &e.manifest.capabilities.blocked_tools)
+            .unwrap_or(&empty_blocked);
+
+
+        // If agent has ToolAll, return all tools (minus blocked)
         if caps.iter().any(|c| matches!(c, Capability::ToolAll)) {
-            return all_tools;
+            return all_tools
+                .into_iter()
+                .filter(|tool| !blocked.iter().any(|b| b == &tool.name))
+                .collect();
         }
 
-        // Filter to tools the agent has capability for
+        // Filter to tools the agent has capability for, minus blocked
         all_tools
             .into_iter()
             .filter(|tool| {
@@ -3982,6 +4098,7 @@ impl OpenFangKernel {
                     _ => false,
                 })
             })
+            .filter(|tool| !blocked.iter().any(|b| b == &tool.name))
             .collect()
     }
 
@@ -4012,11 +4129,20 @@ impl OpenFangKernel {
 
     /// Build a compact skill summary for the system prompt so the agent knows
     /// what extra capabilities are installed.
+    #[allow(dead_code)]
     fn build_skill_summary(&self, skill_allowlist: &[String]) -> String {
         let registry = self
             .skill_registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
+        Self::build_skill_summary_from_registry(&registry, skill_allowlist)
+    }
+
+    /// Build skill summary from an explicit registry (e.g. a snapshot with workspace skills).
+    fn build_skill_summary_from_registry(
+        registry: &openfang_skills::registry::SkillRegistry,
+        skill_allowlist: &[String],
+    ) -> String {
         let skills: Vec<_> = registry
             .list()
             .into_iter()
@@ -4121,13 +4247,20 @@ impl OpenFangKernel {
     // inject_user_personalization() — logic moved to prompt_builder::build_user_section()
 
     pub fn collect_prompt_context(&self, skill_allowlist: &[String]) -> String {
-        let mut context_parts = Vec::new();
-        for skill in self
+        let registry = self
             .skill_registry
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .list()
-        {
+            .unwrap_or_else(|e| e.into_inner());
+        Self::collect_prompt_context_from_registry(&registry, skill_allowlist)
+    }
+
+    /// Collect prompt context from an explicit registry (e.g. a snapshot with workspace skills).
+    fn collect_prompt_context_from_registry(
+        registry: &openfang_skills::registry::SkillRegistry,
+        skill_allowlist: &[String],
+    ) -> String {
+        let mut context_parts = Vec::new();
+        for skill in registry.list() {
             if skill.enabled
                 && (skill_allowlist.is_empty()
                     || skill_allowlist.contains(&skill.manifest.skill.name))
@@ -4239,6 +4372,27 @@ fn manifest_to_capabilities(manifest: &AgentManifest) -> Vec<Capability> {
     }
 
     caps
+}
+
+/// Apply global budget defaults to an agent's resource quota.
+///
+/// When the global budget config specifies limits and the agent still has
+/// the built-in defaults, override them so agents respect the user's config.
+fn apply_budget_defaults(
+    budget: &openfang_types::config::BudgetConfig,
+    resources: &mut ResourceQuota,
+) {
+    // Only override hourly if agent has the built-in default (1.0) and global is set
+    if budget.max_hourly_usd > 0.0 && resources.max_cost_per_hour_usd == 1.0 {
+        resources.max_cost_per_hour_usd = budget.max_hourly_usd;
+    }
+    // Only override daily/monthly if agent has unlimited (0.0) and global is set
+    if budget.max_daily_usd > 0.0 && resources.max_cost_per_day_usd == 0.0 {
+        resources.max_cost_per_day_usd = budget.max_daily_usd;
+    }
+    if budget.max_monthly_usd > 0.0 && resources.max_cost_per_month_usd == 0.0 {
+        resources.max_cost_per_month_usd = budget.max_monthly_usd;
+    }
 }
 
 /// Infer provider from a model name when catalog lookup fails.

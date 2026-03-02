@@ -14,6 +14,12 @@ function settingsPage() {
     modelSearch: '',
     modelProviderFilter: '',
     modelTierFilter: '',
+    showCustomModelForm: false,
+    customModelId: '',
+    customModelProvider: 'openrouter',
+    customModelContext: 128000,
+    customModelMaxOutput: 8192,
+    customModelStatus: '',
     providerKeyInputs: {},
     providerUrlInputs: {},
     providerUrlSaving: {},
@@ -213,8 +219,13 @@ function settingsPage() {
         this.providers = data.providers || [];
         for (var i = 0; i < this.providers.length; i++) {
           var p = this.providers[i];
-          if (p.is_local && p.base_url && !this.providerUrlInputs[p.id]) {
-            this.providerUrlInputs[p.id] = p.base_url;
+          if (p.is_local) {
+            if (!this.providerUrlInputs[p.id]) {
+              this.providerUrlInputs[p.id] = p.base_url || '';
+            }
+            if (this.providerUrlSaving[p.id] === undefined) {
+              this.providerUrlSaving[p.id] = false;
+            }
           }
         }
       } catch(e) { this.providers = []; }
@@ -225,6 +236,26 @@ function settingsPage() {
         var data = await OpenFangAPI.get('/api/models');
         this.models = data.models || [];
       } catch(e) { this.models = []; }
+    },
+
+    async addCustomModel() {
+      var id = this.customModelId.trim();
+      if (!id) return;
+      this.customModelStatus = 'Adding...';
+      try {
+        await OpenFangAPI.post('/api/models/custom', {
+          id: id,
+          provider: this.customModelProvider || 'openrouter',
+          context_window: this.customModelContext || 128000,
+          max_output_tokens: this.customModelMaxOutput || 8192,
+        });
+        this.customModelStatus = 'Added!';
+        this.customModelId = '';
+        this.showCustomModelForm = false;
+        await this.loadModels();
+      } catch(e) {
+        this.customModelStatus = 'Error: ' + (e.message || 'Failed');
+      }
     },
 
     async loadConfigSchema() {
