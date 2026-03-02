@@ -893,11 +893,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             msg.push_str(&format!("  {} — {}\n", card.name, url));
             let desc = &card.description;
             if !desc.is_empty() {
-                let short = if desc.len() > 60 {
-                    &desc[..60]
-                } else {
-                    desc.as_str()
-                };
+                let short = openfang_types::truncate_str(desc, 60);
                 msg.push_str(&format!("    {short}\n"));
             }
         }

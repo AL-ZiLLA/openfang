@@ -51,6 +51,8 @@ pub struct PromptContext {
     pub identity_md: Option<String>,
     /// HEARTBEAT.md content (autonomous agent checklist).
     pub heartbeat_md: Option<String>,
+    /// Peer agents visible to this agent: (name, state, model).
+    pub peer_agents: Vec<(String, String, String)>,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -139,6 +141,11 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
+    // Section 9.5 — Peer Agent Awareness (skip for subagents)
+    if !ctx.is_subagent && !ctx.peer_agents.is_empty() {
+        sections.push(build_peer_agents_section(&ctx.agent_name, &ctx.peer_agents));
+    }
+
     // Section 10 — Safety & Oversight (skip for subagents)
     if !ctx.is_subagent {
         sections.push(SAFETY_SECTION.to_string());
@@ -147,17 +154,8 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     // Section 11 — Operational Guidelines (always present)
     sections.push(OPERATIONAL_GUIDELINES.to_string());
 
-    // Section 12 — Canonical Context (skip for subagents)
-    if !ctx.is_subagent {
-        if let Some(ref canonical) = ctx.canonical_context {
-            if !canonical.is_empty() {
-                sections.push(format!(
-                    "## Previous Conversation Context\n{}",
-                    cap_str(canonical, 500)
-                ));
-            }
-        }
-    }
+    // Section 12 — Canonical Context moved to build_canonical_context_message()
+    // to keep the system prompt stable across turns for provider prompt caching.
 
     // Section 13 — Bootstrap Protocol (only on first-run, skip for subagents)
     if !ctx.is_subagent {
@@ -243,6 +241,21 @@ pub fn build_tools_section(granted_tools: &[String]) -> String {
         out.push_str(&descs.join(", "));
     }
     out
+}
+
+/// Build canonical context as a standalone user message (instead of system prompt).
+///
+/// This keeps the system prompt stable across turns, enabling provider prompt caching
+/// (Anthropic cache_control, etc.). The canonical context changes every turn, so
+/// injecting it in the system prompt caused 82%+ cache misses.
+pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
+    if ctx.is_subagent {
+        return None;
+    }
+    ctx.canonical_context
+        .as_ref()
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("[Previous conversation context]\n{}", cap_str(c, 500)))
 }
 
 /// Build the memory section (Section 4).
@@ -384,6 +397,24 @@ fn build_channel_section(channel: &str) -> String {
          You are responding via {channel}. Keep messages under {limit} chars.\n\
          {hints}"
     )
+}
+
+fn build_peer_agents_section(self_name: &str, peers: &[(String, String, String)]) -> String {
+    let mut out = String::from(
+        "## Peer Agents\n\
+         You are part of a multi-agent system. These agents are running alongside you:\n",
+    );
+    for (name, state, model) in peers {
+        if name == self_name {
+            continue; // Don't list yourself
+        }
+        out.push_str(&format!("- **{}** ({}) — model: {}\n", name, state, model));
+    }
+    out.push_str(
+        "\nYou can communicate with them using `agent_send` (by name) and see all agents with `agent_list`. \
+         Delegate tasks to specialized agents when appropriate.",
+    );
+    out
 }
 
 /// Static safety section.
@@ -791,13 +822,18 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_context() {
+    fn test_canonical_context_not_in_system_prompt() {
         let mut ctx = basic_ctx();
         ctx.canonical_context =
             Some("User was discussing Rust async patterns last time.".to_string());
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("## Previous Conversation Context"));
-        assert!(prompt.contains("Rust async patterns"));
+        // Canonical context should NOT be in system prompt (moved to user message)
+        assert!(!prompt.contains("## Previous Conversation Context"));
+        assert!(!prompt.contains("Rust async patterns"));
+        // But should be available via build_canonical_context_message
+        let msg = build_canonical_context_message(&ctx);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("Rust async patterns"));
     }
 
     #[test]
@@ -806,7 +842,9 @@ mod tests {
         ctx.is_subagent = true;
         ctx.canonical_context = Some("Previous context here.".to_string());
         let prompt = build_system_prompt(&ctx);
-        assert!(!prompt.contains("## Previous Conversation Context"));
+        assert!(!prompt.contains("Previous Conversation Context"));
+        // Should also be None from build_canonical_context_message
+        assert!(build_canonical_context_message(&ctx).is_none());
     }
 
     #[test]

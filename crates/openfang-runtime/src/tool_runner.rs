@@ -135,10 +135,11 @@ pub async fn execute_tool(
     if let Some(kh) = kernel {
         if kh.requires_approval(tool_name) {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
+            let input_str = input.to_string();
             let summary = format!(
                 "{}: {}",
                 tool_name,
-                &input.to_string()[..input.to_string().len().min(200)]
+                openfang_types::truncate_str(&input_str, 200)
             );
             match kh.request_approval(agent_id_str, tool_name, &summary).await {
                 Ok(true) => {
