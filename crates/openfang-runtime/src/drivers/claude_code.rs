@@ -191,7 +191,9 @@ impl LlmDriver for ClaudeCodeDriver {
         cmd.arg("-p")
             .arg(&prompt)
             .arg("--output-format")
-            .arg("json");
+            .arg("json")
+            .arg("--permission-mode")
+            .arg("bypassPermissions");
 
         if let Some(ref model) = model_flag {
             cmd.arg("--model").arg(model);
@@ -291,7 +293,9 @@ impl LlmDriver for ClaudeCodeDriver {
             .arg(&prompt)
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--verbose");
+            .arg("--verbose")
+            .arg("--permission-mode")
+            .arg("bypassPermissions");
 
         if let Some(ref model) = model_flag {
             cmd.arg("--model").arg(model);
