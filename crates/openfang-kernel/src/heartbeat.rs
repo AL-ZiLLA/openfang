@@ -44,7 +44,8 @@ impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
             check_interval_secs: DEFAULT_CHECK_INTERVAL_SECS,
-            default_timeout_secs: DEFAULT_CHECK_INTERVAL_SECS * UNRESPONSIVE_MULTIPLIER,
+            // 180s default: browser tasks and complex LLM calls can take 1-3 minutes
+            default_timeout_secs: 180,
         }
     }
 }
@@ -201,7 +202,7 @@ mod tests {
     fn test_heartbeat_config_default() {
         let config = HeartbeatConfig::default();
         assert_eq!(config.check_interval_secs, 30);
-        assert_eq!(config.default_timeout_secs, 60);
+        assert_eq!(config.default_timeout_secs, 180);
     }
 
     #[test]
