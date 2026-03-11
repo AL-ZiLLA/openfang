@@ -1638,6 +1638,21 @@ impl OpenFangKernel {
             }
         }
 
+        // Snapshot skill registry early so workspace skills are included in the prompt
+        let mut skill_snapshot = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        if let Some(ref workspace) = manifest.workspace {
+            let ws_skills = workspace.join("skills");
+            if ws_skills.exists() {
+                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
+                    warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming prompt): {e}");
+                }
+            }
+        }
+
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
@@ -1668,8 +1683,8 @@ impl OpenFangKernel {
                 base_system_prompt: manifest.model.system_prompt.clone(),
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![],
-                skill_summary: self.build_skill_summary(&manifest.skills),
-                skill_prompt_context: self.collect_prompt_context(&manifest.skills),
+                skill_summary: Self::build_skill_summary_from_registry(&skill_snapshot, &manifest.skills),
+                skill_prompt_context: Self::collect_prompt_context_from_registry(&skill_snapshot, &manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -1773,21 +1788,7 @@ impl OpenFangKernel {
             }
 
             let messages_before = session.messages.len();
-            let mut skill_snapshot = kernel_clone
-                .skill_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .snapshot();
-
-            // Load workspace-scoped skills (override global skills with same name)
-            if let Some(ref workspace) = manifest.workspace {
-                let ws_skills = workspace.join("skills");
-                if ws_skills.exists() {
-                    if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
-                        warn!(agent_id = %agent_id, "Failed to load workspace skills (streaming): {e}");
-                    }
-                }
-            }
+            // skill_snapshot already created (with workspace skills) before prompt build
 
             // Create a phase callback that emits PhaseChange events to WS/SSE clients
             let phase_tx = tx.clone();
@@ -2109,6 +2110,21 @@ impl OpenFangKernel {
             }
         }
 
+        // Snapshot skill registry early so workspace skills are included in the prompt
+        let mut skill_snapshot = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot();
+        if let Some(ref workspace) = manifest.workspace {
+            let ws_skills = workspace.join("skills");
+            if ws_skills.exists() {
+                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
+                    warn!(agent_id = %agent_id, "Failed to load workspace skills: {e}");
+                }
+            }
+        }
+
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
@@ -2139,8 +2155,8 @@ impl OpenFangKernel {
                 base_system_prompt: manifest.model.system_prompt.clone(),
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![], // Recalled in agent_loop, not here
-                skill_summary: self.build_skill_summary(&manifest.skills),
-                skill_prompt_context: self.collect_prompt_context(&manifest.skills),
+                skill_summary: Self::build_skill_summary_from_registry(&skill_snapshot, &manifest.skills),
+                skill_prompt_context: Self::collect_prompt_context_from_registry(&skill_snapshot, &manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -2267,22 +2283,7 @@ impl OpenFangKernel {
                 .map(|m| m.context_window as usize)
         });
 
-        // Snapshot skill registry before async call (RwLockReadGuard is !Send)
-        let mut skill_snapshot = self
-            .skill_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .snapshot();
-
-        // Load workspace-scoped skills (override global skills with same name)
-        if let Some(ref workspace) = manifest.workspace {
-            let ws_skills = workspace.join("skills");
-            if ws_skills.exists() {
-                if let Err(e) = skill_snapshot.load_workspace_skills(&ws_skills) {
-                    warn!(agent_id = %agent_id, "Failed to load workspace skills: {e}");
-                }
-            }
-        }
+        // skill_snapshot already created (with workspace skills) before prompt build
 
         // Build link context from user message (auto-extract URLs for the agent)
         let message_with_links = if let Some(link_ctx) =
@@ -4156,34 +4157,64 @@ impl OpenFangKernel {
             }
         };
 
-        // If fallback models are configured, wrap in FallbackDriver
-        if !manifest.fallback_models.is_empty() {
+        // If fallback models are configured (per-agent or global), wrap in FallbackDriver.
+        // Per-agent fallback_models take priority; if empty, fall back to global config.
+        let has_per_agent_fallbacks = !manifest.fallback_models.is_empty();
+        let has_global_fallbacks = !self.config.fallback_providers.is_empty();
+
+        if has_per_agent_fallbacks || has_global_fallbacks {
             // Primary driver uses the agent's own model name (already set in request)
             let mut chain: Vec<(std::sync::Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> =
                 vec![(primary.clone(), String::new())];
-            for fb in &manifest.fallback_models {
-                let fb_api_key = if let Some(env) = &fb.api_key_env {
-                    std::env::var(env).ok()
-                } else {
-                    // Resolve using provider_api_keys / convention for custom providers
-                    let env_var = self.config.resolve_api_key_env(&fb.provider);
-                    std::env::var(&env_var).ok()
-                };
-                let config = DriverConfig {
-                    provider: fb.provider.clone(),
-                    api_key: fb_api_key,
-                    base_url: fb
-                        .base_url
-                        .clone()
-                        .or_else(|| self.lookup_provider_url(&fb.provider)),
-                };
-                match drivers::create_driver(&config) {
-                    Ok(d) => chain.push((d, fb.model.clone())),
-                    Err(e) => {
-                        warn!("Fallback driver '{}' failed to init: {e}", fb.provider);
+
+            if has_per_agent_fallbacks {
+                for fb in &manifest.fallback_models {
+                    let fb_api_key = if let Some(env) = &fb.api_key_env {
+                        std::env::var(env).ok()
+                    } else {
+                        let env_var = self.config.resolve_api_key_env(&fb.provider);
+                        std::env::var(&env_var).ok()
+                    };
+                    let config = DriverConfig {
+                        provider: fb.provider.clone(),
+                        api_key: fb_api_key,
+                        base_url: fb
+                            .base_url
+                            .clone()
+                            .or_else(|| self.lookup_provider_url(&fb.provider)),
+                    };
+                    match drivers::create_driver(&config) {
+                        Ok(d) => chain.push((d, fb.model.clone())),
+                        Err(e) => {
+                            warn!("Fallback driver '{}' failed to init: {e}", fb.provider);
+                        }
+                    }
+                }
+            } else {
+                // Use global fallback_providers for agents without per-agent fallbacks
+                for fb in &self.config.fallback_providers {
+                    let fb_api_key = if fb.api_key_env.is_empty() {
+                        None
+                    } else {
+                        std::env::var(&fb.api_key_env).ok()
+                    };
+                    let config = DriverConfig {
+                        provider: fb.provider.clone(),
+                        api_key: fb_api_key,
+                        base_url: fb
+                            .base_url
+                            .clone()
+                            .or_else(|| self.lookup_provider_url(&fb.provider)),
+                    };
+                    match drivers::create_driver(&config) {
+                        Ok(d) => chain.push((d, fb.model.clone())),
+                        Err(e) => {
+                            warn!("Global fallback driver '{}' failed to init: {e}", fb.provider);
+                        }
                     }
                 }
             }
+
             if chain.len() > 1 {
                 return Ok(Arc::new(
                     openfang_runtime::drivers::fallback::FallbackDriver::with_models(chain),
@@ -4671,11 +4702,20 @@ impl OpenFangKernel {
 
     /// Build a compact skill summary for the system prompt so the agent knows
     /// what extra capabilities are installed.
+    #[allow(dead_code)]
     fn build_skill_summary(&self, skill_allowlist: &[String]) -> String {
         let registry = self
             .skill_registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
+        Self::build_skill_summary_from_registry(&registry, skill_allowlist)
+    }
+
+    /// Build skill summary from an explicit registry (e.g. a snapshot with workspace skills).
+    fn build_skill_summary_from_registry(
+        registry: &openfang_skills::registry::SkillRegistry,
+        skill_allowlist: &[String],
+    ) -> String {
         let skills: Vec<_> = registry
             .list()
             .into_iter()
@@ -4780,13 +4820,20 @@ impl OpenFangKernel {
     // inject_user_personalization() — logic moved to prompt_builder::build_user_section()
 
     pub fn collect_prompt_context(&self, skill_allowlist: &[String]) -> String {
-        let mut context_parts = Vec::new();
-        for skill in self
+        let registry = self
             .skill_registry
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .list()
-        {
+            .unwrap_or_else(|e| e.into_inner());
+        Self::collect_prompt_context_from_registry(&registry, skill_allowlist)
+    }
+
+    /// Collect prompt context from an explicit registry (e.g. a snapshot with workspace skills).
+    fn collect_prompt_context_from_registry(
+        registry: &openfang_skills::registry::SkillRegistry,
+        skill_allowlist: &[String],
+    ) -> String {
+        let mut context_parts = Vec::new();
+        for skill in registry.list() {
             if skill.enabled
                 && (skill_allowlist.is_empty()
                     || skill_allowlist.contains(&skill.manifest.skill.name))
