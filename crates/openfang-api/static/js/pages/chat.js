@@ -669,10 +669,44 @@ function chatPage() {
         case 'text_delta':
           var last = this.messages.length ? this.messages[this.messages.length - 1] : null;
           if (last && last.streaming) {
-            if (last.thinking) { last.text = ''; last.thinking = false; }
+            if (last.thinking) { last.text = ''; last.thinking = false; last._rawText = ''; }
             // If we already detected a text-based tool call, skip further text
             if (last._toolTextDetected) break;
-            last.text += data.content;
+            // Accumulate raw text separately for <tool_call> parsing
+            if (last._rawText == null) last._rawText = last.text || '';
+            last._rawText += data.content;
+            // Parse complete <tool_call>/<tool-call> blocks → promote to tool cards
+            var tcBlockRe = /<tool[_-]call>\s*([\s\S]*?)\s*<\/tool[_-]call>/g;
+            var tcm;
+            if (!last._seenToolCalls) last._seenToolCalls = {};
+            while ((tcm = tcBlockRe.exec(last._rawText)) !== null) {
+              var tcJson = tcm[1].trim();
+              if (last._seenToolCalls[tcJson]) continue;
+              last._seenToolCalls[tcJson] = true;
+              try {
+                var tc = JSON.parse(tcJson);
+                if (!last.tools) last.tools = [];
+                last.tools.push({
+                  id: tc.id || (tc.name + '-tc-' + Date.now()),
+                  name: tc.name, running: true, expanded: false,
+                  input: JSON.stringify(tc.input || {}),
+                  result: '', is_error: false
+                });
+              } catch(e) { /* malformed tool_call JSON */ }
+            }
+            // Derive display text: strip tool/response XML blocks + hide unclosed tags
+            var displayText = last._rawText
+              .replace(/<tool[_-]call>\s*[\s\S]*?\s*<\/tool[_-]call>/g, '')
+              .replace(/<tool[_-](?:result|response)[\s\S]*?<\/tool[_-](?:result|response)>/g, '');
+            // Hide unclosed tool tags (partial stream)
+            var unclosedRe = /<tool[_-](?:call|result|response)(?:\s|>)/;
+            var ucMatch = displayText.match(unclosedRe);
+            if (ucMatch && ucMatch.index !== undefined) {
+              var afterUc = displayText.substring(ucMatch.index);
+              var closingTag = afterUc.match(/<\/tool[_-](?:call|result|response)>/);
+              if (!closingTag) displayText = displayText.substring(0, ucMatch.index);
+            }
+            last.text = displayText.trimStart();
             // Detect function-call patterns streamed as text and convert to tool cards
             var fcIdx = last.text.search(/\w+<\/function[=,>]/);
             if (fcIdx === -1) fcIdx = last.text.search(/<function=\w+>/);
@@ -697,7 +731,7 @@ function chatPage() {
             }
             this.tokenCount = Math.round(last.text.length / 4);
           } else {
-            this.messages.push({ id: ++msgId, role: 'agent', text: data.content, meta: '', streaming: true, tools: [] });
+            this.messages.push({ id: ++msgId, role: 'agent', text: data.content, meta: '', streaming: true, tools: [], _rawText: data.content });
           }
           this.scrollToBottom();
           break;
