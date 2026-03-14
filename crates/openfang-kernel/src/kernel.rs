@@ -1486,9 +1486,12 @@ impl OpenFangKernel {
                     format!("error: {e}"),
                 );
 
+                // Mark agent as Crashed so heartbeat/dashboard can see the failure
+                let _ = self.registry.set_state(agent_id, AgentState::Crashed);
+
                 // Record the failure in supervisor for health reporting
                 self.supervisor.record_panic();
-                warn!(agent_id = %agent_id, error = %e, "Agent loop failed — recorded in supervisor");
+                warn!(agent_id = %agent_id, error = %e, "Agent loop failed — state set to Crashed");
                 Err(e)
             }
         }
@@ -1564,8 +1567,9 @@ impl OpenFangKernel {
                         Ok(result)
                     }
                     Err(e) => {
+                        let _ = kernel_clone.registry.set_state(agent_id, AgentState::Crashed);
                         kernel_clone.supervisor.record_panic();
-                        warn!(agent_id = %agent_id, error = %e, "Non-LLM agent failed");
+                        warn!(agent_id = %agent_id, error = %e, "Non-LLM agent failed — state set to Crashed");
                         Err(e)
                     }
                 }
@@ -1895,8 +1899,9 @@ impl OpenFangKernel {
                     Ok(result)
                 }
                 Err(e) => {
+                    let _ = kernel_clone.registry.set_state(agent_id, AgentState::Crashed);
                     kernel_clone.supervisor.record_panic();
-                    warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed");
+                    warn!(agent_id = %agent_id, error = %e, "Streaming agent loop failed — state set to Crashed");
                     Err(KernelError::OpenFang(e))
                 }
             }
@@ -3901,11 +3906,12 @@ impl OpenFangKernel {
     /// Periodically checks all running agents' last_active timestamps and
     /// publishes `HealthCheckFailed` events for unresponsive agents.
     fn start_heartbeat_monitor(self: &Arc<Self>) {
-        use crate::heartbeat::{check_agents, is_quiet_hours, HeartbeatConfig};
+        use crate::heartbeat::{check_agents, is_quiet_hours, HeartbeatConfig, RecoveryTracker};
 
         let kernel = Arc::clone(self);
         let config = HeartbeatConfig::default();
         let interval_secs = config.check_interval_secs;
+        let recovery_tracker = RecoveryTracker::new();
 
         tokio::spawn(async move {
             let mut interval =
@@ -3932,7 +3938,102 @@ impl OpenFangKernel {
                         }
                     }
 
-                    if status.unresponsive {
+                    // --- Auto-recovery for crashed agents ---
+                    if status.state == AgentState::Crashed {
+                        let failures = recovery_tracker.failure_count(status.agent_id);
+
+                        if failures >= config.max_recovery_attempts {
+                            // Already exhausted recovery attempts — mark Terminated
+                            // (only do this once, check current state)
+                            if let Some(entry) = kernel.registry.get(status.agent_id) {
+                                if entry.state == AgentState::Crashed {
+                                    let _ = kernel
+                                        .registry
+                                        .set_state(status.agent_id, AgentState::Terminated);
+                                    warn!(
+                                        agent = %status.name,
+                                        attempts = failures,
+                                        "Agent exhausted all recovery attempts — marked Terminated. Manual restart required."
+                                    );
+                                    // Publish event for notification channels
+                                    let event = Event::new(
+                                        status.agent_id,
+                                        EventTarget::System,
+                                        EventPayload::System(SystemEvent::HealthCheckFailed {
+                                            agent_id: status.agent_id,
+                                            unresponsive_secs: status.inactive_secs as u64,
+                                        }),
+                                    );
+                                    kernel.event_bus.publish(event).await;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Check cooldown
+                        if !recovery_tracker.can_attempt(
+                            status.agent_id,
+                            config.recovery_cooldown_secs,
+                        ) {
+                            debug!(
+                                agent = %status.name,
+                                "Recovery cooldown active, skipping"
+                            );
+                            continue;
+                        }
+
+                        // Attempt recovery: reset state to Running
+                        let attempt = recovery_tracker.record_attempt(status.agent_id);
+                        info!(
+                            agent = %status.name,
+                            attempt = attempt,
+                            max = config.max_recovery_attempts,
+                            "Auto-recovering crashed agent (attempt {}/{})",
+                            attempt,
+                            config.max_recovery_attempts
+                        );
+                        let _ = kernel
+                            .registry
+                            .set_state(status.agent_id, AgentState::Running);
+
+                        // Publish recovery event
+                        let event = Event::new(
+                            status.agent_id,
+                            EventTarget::System,
+                            EventPayload::System(SystemEvent::HealthCheckFailed {
+                                agent_id: status.agent_id,
+                                unresponsive_secs: 0, // 0 signals recovery attempt
+                            }),
+                        );
+                        kernel.event_bus.publish(event).await;
+                        continue;
+                    }
+
+                    // --- Running agent that recovered successfully ---
+                    // If agent is Running and was previously in recovery, clear the tracker
+                    if status.state == AgentState::Running
+                        && !status.unresponsive
+                        && recovery_tracker.failure_count(status.agent_id) > 0
+                    {
+                        info!(
+                            agent = %status.name,
+                            "Agent recovered successfully — resetting recovery tracker"
+                        );
+                        recovery_tracker.reset(status.agent_id);
+                    }
+
+                    // --- Unresponsive Running agent ---
+                    if status.unresponsive && status.state == AgentState::Running {
+                        // Mark as Crashed so next cycle triggers recovery
+                        let _ = kernel
+                            .registry
+                            .set_state(status.agent_id, AgentState::Crashed);
+                        warn!(
+                            agent = %status.name,
+                            inactive_secs = status.inactive_secs,
+                            "Unresponsive Running agent marked as Crashed for recovery"
+                        );
+
                         let event = Event::new(
                             status.agent_id,
                             EventTarget::System,
