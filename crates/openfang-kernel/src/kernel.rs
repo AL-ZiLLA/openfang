@@ -1536,6 +1536,14 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
+        // Wake idle agents on message arrival
+        if let Some(entry) = self.registry.get(agent_id) {
+            if entry.state == AgentState::Idle {
+                info!(agent = %entry.name, "Waking idle agent — message received");
+                let _ = self.registry.set_state(agent_id, AgentState::Running);
+            }
+        }
+
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
         // succession (e.g. rapid voice messages via Telegram). Messages for different
@@ -1634,6 +1642,14 @@ impl OpenFangKernel {
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
     )> {
+        // Wake idle agents on message arrival
+        if let Some(entry) = self.registry.get(agent_id) {
+            if entry.state == AgentState::Idle {
+                info!(agent = %entry.name, "Waking idle agent — streaming message received");
+                let _ = self.registry.set_state(agent_id, AgentState::Running);
+            }
+        }
+
         // Enforce quota before spawning the streaming task
         self.scheduler
             .check_quota(agent_id)
@@ -4059,6 +4075,14 @@ impl OpenFangKernel {
                         let agent_id = job.agent_id;
                         let job_name = job.name.clone();
 
+                        // Wake idle agents for cron execution
+                        if let Some(entry) = kernel.registry.get(agent_id) {
+                            if entry.state == AgentState::Idle {
+                                info!(agent = %entry.name, job = %job_name, "Waking idle agent — cron job due");
+                                let _ = kernel.registry.set_state(agent_id, AgentState::Running);
+                            }
+                        }
+
                         match &job.action {
                             openfang_types::scheduler::CronAction::SystemEvent { text } => {
                                 tracing::debug!(job = %job_name, "Cron: firing system event");
@@ -4464,25 +4488,52 @@ impl OpenFangKernel {
 
                     // --- Unresponsive Running agent ---
                     if status.unresponsive && status.state == AgentState::Running {
-                        // Mark as Crashed so next cycle triggers recovery
-                        let _ = kernel
-                            .registry
-                            .set_state(status.agent_id, AgentState::Crashed);
-                        warn!(
-                            agent = %status.name,
-                            inactive_secs = status.inactive_secs,
-                            "Unresponsive Running agent marked as Crashed for recovery"
-                        );
+                        // Smart idle detection: check if the agent has pending work
+                        // before marking it as crashed.
+                        let has_pending_cron = kernel.cron_scheduler
+                            .has_due_jobs_soon(status.agent_id, config.default_timeout_secs as i64);
+                        let has_active_bg_task = kernel.background.has_task(status.agent_id);
+                        let has_active_schedule = kernel.registry.get(status.agent_id)
+                            .map(|e| !matches!(e.manifest.schedule, ScheduleMode::Reactive))
+                            .unwrap_or(false);
 
-                        let event = Event::new(
-                            status.agent_id,
-                            EventTarget::System,
-                            EventPayload::System(SystemEvent::HealthCheckFailed {
-                                agent_id: status.agent_id,
-                                unresponsive_secs: status.inactive_secs as u64,
-                            }),
-                        );
-                        kernel.event_bus.publish(event).await;
+                        if has_pending_cron || has_active_bg_task || has_active_schedule {
+                            // Agent SHOULD be alive but isn't responding — real crash
+                            let _ = kernel
+                                .registry
+                                .set_state(status.agent_id, AgentState::Crashed);
+                            warn!(
+                                agent = %status.name,
+                                inactive_secs = status.inactive_secs,
+                                has_pending_cron,
+                                has_active_bg_task,
+                                has_active_schedule,
+                                "Unresponsive Running agent marked as Crashed for recovery"
+                            );
+
+                            let event = Event::new(
+                                status.agent_id,
+                                EventTarget::System,
+                                EventPayload::System(SystemEvent::HealthCheckFailed {
+                                    agent_id: status.agent_id,
+                                    unresponsive_secs: status.inactive_secs as u64,
+                                }),
+                            );
+                            kernel.event_bus.publish(event).await;
+                        } else {
+                            // Agent has nothing to do — mark idle, don't recover
+                            let _ = kernel
+                                .registry
+                                .set_state(status.agent_id, AgentState::Idle);
+                            info!(
+                                agent = %status.name,
+                                inactive_secs = status.inactive_secs,
+                                "Agent has no pending work — marked Idle"
+                            );
+                            // Clear any prior recovery failures so the agent
+                            // starts fresh when it wakes up
+                            recovery_tracker.reset(status.agent_id);
+                        }
                     }
                 }
             }

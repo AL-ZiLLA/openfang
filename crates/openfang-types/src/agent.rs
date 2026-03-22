@@ -183,6 +183,8 @@ pub enum AgentState {
     Terminated,
     /// Agent crashed and is awaiting recovery.
     Crashed,
+    /// Agent is idle — no pending work, will be woken on demand.
+    Idle,
 }
 
 /// Permission-based operational mode for an agent.

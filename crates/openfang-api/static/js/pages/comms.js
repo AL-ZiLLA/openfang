@@ -100,7 +100,7 @@ function commsPage() {
     stateBadgeClass(state) {
       switch(state) {
         case 'Running': return 'badge badge-success';
-        case 'Suspended': return 'badge badge-warning';
+        case 'Idle': case 'Suspended': return 'badge badge-warning';
         case 'Terminated': case 'Crashed': return 'badge badge-danger';
         default: return 'badge badge-dim';
       }

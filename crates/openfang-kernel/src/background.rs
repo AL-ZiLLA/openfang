@@ -197,6 +197,11 @@ impl BackgroundExecutor {
     pub fn active_count(&self) -> usize {
         self.tasks.len()
     }
+
+    /// Check if an agent has an active background task loop.
+    pub fn has_task(&self, agent_id: AgentId) -> bool {
+        self.tasks.contains_key(&agent_id)
+    }
 }
 
 /// Parse a proactive condition string into a `TriggerPattern`.

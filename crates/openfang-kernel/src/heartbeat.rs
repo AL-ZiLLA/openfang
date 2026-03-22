@@ -126,7 +126,7 @@ impl Default for RecoveryTracker {
     }
 }
 
-/// Check all running and crashed agents and return their heartbeat status.
+/// Check all running, crashed, and idle agents and return their heartbeat status.
 ///
 /// This is a pure function — it doesn't start a background task.
 /// The caller (kernel) can run this periodically or in a background task.
@@ -135,9 +135,10 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
     let mut statuses = Vec::new();
 
     for entry_ref in registry.list() {
-        // Check Running agents (for unresponsiveness) and Crashed agents (for recovery)
+        // Check Running agents (for unresponsiveness), Crashed (for recovery),
+        // and Idle (so kernel can wake them if work arrives)
         match entry_ref.state {
-            AgentState::Running | AgentState::Crashed => {}
+            AgentState::Running | AgentState::Crashed | AgentState::Idle => {}
             _ => continue,
         }
 
@@ -151,8 +152,13 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
             .map(|a| a.heartbeat_interval_secs * UNRESPONSIVE_MULTIPLIER)
             .unwrap_or(config.default_timeout_secs) as i64;
 
-        // Crashed agents are always considered unresponsive
-        let unresponsive = entry_ref.state == AgentState::Crashed || inactive_secs > timeout_secs;
+        // Idle agents are never considered unresponsive — they're expected to be inactive.
+        // Crashed agents are always considered unresponsive.
+        let unresponsive = match entry_ref.state {
+            AgentState::Idle => false,
+            AgentState::Crashed => true,
+            _ => inactive_secs > timeout_secs,
+        };
 
         if unresponsive && entry_ref.state == AgentState::Running {
             warn!(
@@ -166,6 +172,12 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
                 agent = %entry_ref.name,
                 inactive_secs,
                 "Agent is crashed — eligible for recovery"
+            );
+        } else if entry_ref.state == AgentState::Idle {
+            debug!(
+                agent = %entry_ref.name,
+                inactive_secs,
+                "Agent is idle — waiting for work"
             );
         } else {
             debug!(

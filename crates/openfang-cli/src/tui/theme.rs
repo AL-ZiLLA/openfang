@@ -98,7 +98,9 @@ pub fn state_badge(state: &str) -> (&'static str, Style) {
     let lower = state.to_lowercase();
     if lower.contains("run") {
         ("[RUN]", badge_running())
-    } else if lower.contains("creat") || lower.contains("new") || lower.contains("idle") {
+    } else if lower.contains("idle") {
+        ("[IDL]", badge_suspended())
+    } else if lower.contains("creat") || lower.contains("new") {
         ("[NEW]", badge_created())
     } else if lower.contains("sus") || lower.contains("paus") {
         ("[SUS]", badge_suspended())

@@ -285,6 +285,20 @@ impl CronScheduler {
         self.jobs.len()
     }
 
+    /// Check if an agent has any enabled cron jobs due within `window_secs` from now.
+    ///
+    /// Used by the heartbeat monitor to distinguish idle agents (no upcoming work)
+    /// from agents that should be alive (cron firing soon).
+    pub fn has_due_jobs_soon(&self, agent_id: AgentId, window_secs: i64) -> bool {
+        let deadline = Utc::now() + Duration::seconds(window_secs);
+        self.jobs.iter().any(|entry| {
+            let meta = entry.value();
+            meta.job.agent_id == agent_id
+                && meta.job.enabled
+                && meta.job.next_run.map(|t| t <= deadline).unwrap_or(false)
+        })
+    }
+
     /// Return jobs whose `next_run` is at or before `now` and are enabled.
     ///
     /// **Important**: This also pre-advances each due job's `next_run` to the

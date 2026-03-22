@@ -702,7 +702,7 @@ fn draw_task_modal(f: &mut Frame, area: Rect, state: &CommsState) {
 fn state_color(state: &str) -> Style {
     match state {
         "Running" => Style::default().fg(theme::GREEN),
-        "Suspended" => Style::default().fg(theme::YELLOW),
+        "Suspended" | "Idle" => Style::default().fg(theme::YELLOW),
         "Terminated" | "Crashed" => Style::default().fg(theme::RED),
         _ => theme::dim_style(),
     }
